@@ -1,0 +1,20 @@
+[package]
+name = "p2p-zk-blockchain"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+libp2p = { version = "0.53", features = [
+    "tcp",
+    "noise",
+    "yamux",
+    "gossipsub",
+    "mdns",
+    "request-response",
+    "identify",
+    "kad",
+    "macros",
+    "tokio",
+    "ping",
+] }
+tokio = { version = "1.41.5", features = ["full"] }
