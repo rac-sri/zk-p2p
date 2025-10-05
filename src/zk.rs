@@ -1,12 +1,22 @@
 use ark_bls12_381::Fr;
+use ark_crypto_primitives::crh::bowe_hopwood::constraints::CRHGadget;
+use ark_crypto_primitives::crh::{CRHScheme, CRHSchemeGadget, pedersen};
 use ark_ec::AffineRepr;
+use ark_ed_on_bls12_381::constraints::EdwardsVar;
+use ark_ff::BigInteger;
+use ark_ff::PrimeField;
+use ark_r1cs_std::alloc::AllocVar;
+use ark_r1cs_std::prelude::ToBytesGadget;
+use ark_r1cs_std::uint8::UInt8;
 use ark_relations::r1cs::Field;
 use ark_relations::{
     lc,
     r1cs::{ConstraintSynthesizer, ConstraintSystemRef, SynthesisError},
 };
-
 pub type ConstraintF = ark_bls12_381::Fr;
+
+use ark_ed_on_bls12_381::{EdwardsProjective as JubJub, EdwardsProjective as Ed};
+use ark_std::rand::{RngCore, SeedableRng};
 
 #[derive(Clone)]
 pub struct PedersonParams<A: AffineRepr> {
@@ -17,54 +27,6 @@ pub struct PedersenCircuit<C: AffineRepr> {
     generators: PedersonParams<C>,
     message: Vec<C::ScalarField>,
     randomness: Vec<C::ScalarField>,
-}
-
-impl<C: AffineRepr> PedersonParams<C> {
-    pub fn new(generators: Vec<C>) -> Self {
-        Self { generators }
-    }
-
-    pub fn commit(
-        &self,
-        cs: ConstraintSystemRef<C::ScalarField>,
-        message: &[C::ScalarField],
-        randomness: &[C::ScalarField],
-    ) -> Result<(), SynthesisError> {
-        let one = cs.new_witness_variable(|| Ok(C::ScalarField::ONE))?;
-        let mut commitment = cs.new_witness_variable(|| Ok(C::ScalarField::ONE))?;
-        for (i, m) in message.iter().enumerate() {
-            let w1 = cs.new_witness_variable(|| Ok(*m))?;
-            // Represent the generator's action through a witness
-            let generator_effect = cs.new_witness_variable(|| Ok(C::ScalarField::ONE))?;
-            let w3 = cs.new_witness_variable(|| Ok(randomness[i]))?;
-
-            // This is a simplified approach - in a real implementation,
-            // you would need to properly represent the scalar multiplication of the curve point
-            let temp_witness = cs.new_witness_variable(|| Ok(C::ScalarField::ONE))?;
-            cs.enforce_constraint(lc!() + w1, lc!() + generator_effect, lc!() + temp_witness)?;
-
-            let temp_sum_witness = cs.new_witness_variable(|| Ok(C::ScalarField::ONE))?;
-            cs.enforce_constraint(
-                lc!() + temp_witness + w3,
-                lc!() + one,
-                lc!() + temp_sum_witness,
-            )?;
-
-            if i > 0 {
-                let final_commitment = cs.new_witness_variable(|| Ok(C::ScalarField::ONE))?;
-                cs.enforce_constraint(
-                    lc!() + commitment + temp_sum_witness,
-                    lc!() + one,
-                    lc!() + final_commitment,
-                )?;
-                commitment = final_commitment;
-            } else {
-                commitment = temp_sum_witness;
-            }
-        }
-
-        Ok(())
-    }
 }
 
 impl<C: AffineRepr> PedersenCircuit<C> {
@@ -81,19 +43,44 @@ impl<C: AffineRepr> PedersenCircuit<C> {
     }
 }
 
-impl<C: AffineRepr> ConstraintSynthesizer<C::ScalarField> for PedersenCircuit<C> {
+impl ConstraintSynthesizer<Fr> for PedersenCircuit<ark_bls12_381::G1Affine> {
     fn generate_constraints(
         self,
-        cs: ark_relations::r1cs::ConstraintSystemRef<C::ScalarField>,
+        cs: ark_relations::r1cs::ConstraintSystemRef<Fr>,
     ) -> ark_relations::r1cs::Result<()> {
-        // Allocate the commitment as a public input - represents the commitment somehow using scalar AffineReprs
-        let commitment_var = cs.new_input_variable(|| Ok(C::ScalarField::ONE))?;
+        type CRH = pedersen::CRH<JubJub, Window>;
 
-        // Compute the commitment in the circuit
-        let calculated_commitment =
-            self.generators
-                .commit(cs.clone(), &self.message, &self.randomness)?;
+        type CRHGadget = pedersen::constraints::CRHGadget<JubJub, EdwardsVar, Window>;
 
+        let mut rng = ark_std::rand::rngs::StdRng::from_seed([1; 32]);
+        let parameters = CRH::setup(&mut rng).unwrap();
+
+        let input_message: Vec<u8> = self
+            .message
+            .iter()
+            .flat_map(|x| x.into_bigint().to_bytes_le())
+            .collect();
+
+        let parameters_var = pedersen::constraints::CRHParametersVar::new_constant(
+            ark_relations::ns!(cs, "CRH Parameters"),
+            &parameters,
+        )
+        .unwrap();
+
+        let mut input_bytes = vec![];
+        for byte in input_message.iter() {
+            input_bytes.push(UInt8::new_witness(cs.clone(), || Ok(byte)).unwrap());
+        }
+
+        CRHGadget::evaluate(&parameters_var, &input_bytes).unwrap();
         Ok(())
     }
+}
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub(super) struct Window;
+
+impl pedersen::Window for Window {
+    const WINDOW_SIZE: usize = 127;
+    const NUM_WINDOWS: usize = 9;
 }

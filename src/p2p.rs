@@ -1,18 +1,21 @@
-use std::time::Duration;
-use tokio::sync::mpsc;
-
+use ark_bls12_381::{Bls12_381, Fr, G1Affine};
+use ark_ff::{PrimeField, UniformRand};
+use ark_groth16::Groth16;
+use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
+use ark_snark::{CircuitSpecificSetupSNARK, SNARK};
+use ark_std::rand::SeedableRng;
 use libp2p::futures::StreamExt;
-
 use libp2p::gossipsub::{IdentTopic, MessageAuthenticity, MessageId};
 use libp2p::swarm::Config;
 use libp2p::{Multiaddr, Transport};
 use libp2p::{
-    PeerId, Swarm, gossipsub, mdns, noise,
-    request_response::{self, OutboundRequestId, ProtocolSupport},
-    swarm::NetworkBehaviour,
-    swarm::SwarmEvent,
-    tcp, yamux,
+    PeerId, Swarm, gossipsub, mdns, noise, swarm::NetworkBehaviour, swarm::SwarmEvent, tcp, yamux,
 };
+use sha256::digest;
+use std::time::Duration;
+use tokio::sync::mpsc;
+
+use crate::zk::{PedersenCircuit, PedersonParams};
 
 pub enum NodeCommand {
     SendMessage(String, String),
@@ -28,6 +31,8 @@ pub struct NetworkNode {
     pub(crate) swarm: Swarm<P2PBehaviour>,
     command_receiver: mpsc::UnboundedReceiver<NodeCommand>,
     command_sender: mpsc::UnboundedSender<NodeCommand>,
+    proving_key: ark_groth16::ProvingKey<Bls12_381>,
+    verifying_key: ark_groth16::VerifyingKey<Bls12_381>,
 }
 
 impl NetworkNode {
@@ -44,6 +49,22 @@ impl NetworkNode {
                 .unwrap(),
             mdns: mdns::tokio::Behaviour::new(mdns::Config::default(), local_peer_id).unwrap(),
         };
+
+        let mut rng = ark_std::rand::rngs::StdRng::from_seed([1; 32]);
+        let dummy_generators = vec![G1Affine::rand(&mut rng); 3];
+        let dummy_message = vec![Fr::rand(&mut rng); 3];
+        let dummy_randomness = vec![Fr::rand(&mut rng); 3];
+
+        let dummy_circuit = PedersenCircuit::new(
+            PedersonParams {
+                generators: dummy_generators,
+            },
+            dummy_message,
+            dummy_randomness,
+        );
+
+        let (proving_key, verifying_key) =
+            Groth16::<Bls12_381>::setup(dummy_circuit, &mut rng).unwrap();
 
         // transport with encryption
         let transport = tcp::tokio::Transport::new(tcp::Config::default().nodelay(true))
@@ -67,6 +88,8 @@ impl NetworkNode {
             swarm,
             command_receiver,
             command_sender,
+            proving_key,
+            verifying_key,
         }
     }
 
@@ -93,16 +116,46 @@ impl NetworkNode {
     }
 
     pub fn send_message(&mut self, topic_name: &str, message: &str) -> Result<MessageId, String> {
+        let mut rng = ark_std::test_rng();
+        let num_generators = 3;
+        let mut generators = Vec::with_capacity(num_generators);
+        for _ in 0..num_generators {
+            generators.push(G1Affine::rand(&mut rng));
+        }
+
+        let message_fr = self.string_to_fr_vec(message, 3);
+        let randomness = vec![Fr::rand(&mut rng), Fr::rand(&mut rng), Fr::rand(&mut rng)];
+
+        let circuit = PedersenCircuit::new(
+            PedersonParams {
+                generators: generators.clone(),
+            },
+            message_fr.clone(),
+            randomness.clone(),
+        );
+
+        let mut rng = ark_std::rand::rngs::StdRng::from_seed([1; 32]);
+        let proof = Groth16::<Bls12_381>::prove(&self.proving_key, circuit, &mut rng).unwrap();
+        let mut buffer = Vec::new();
+        proof.serialize_uncompressed(&mut buffer).unwrap();
+
         let topic = IdentTopic::new(topic_name);
         let message_id = self
             .swarm
             .behaviour_mut()
             .gossipsub
-            .publish(topic, message.as_bytes())
+            .publish(topic, buffer)
             .map_err(|e| format!("Failed to publish message: {}", e))?;
-        println!("Sent message to topic '{}': {}", topic_name, message);
+        println!("Sent message to topic '{}': {:?}", topic_name, proof);
         Ok(message_id)
     }
+
+    pub fn verify_message(&self, proof: Vec<u8>) -> Result<bool, String> {
+        let proof = ark_groth16::Proof::deserialize_uncompressed(proof.as_slice()).unwrap();
+        let verifier = Groth16::<Bls12_381>::verify(&self.verifying_key, &[], &proof).unwrap();
+        Ok(verifier)
+    }
+
     pub async fn run(&mut self) -> Result<(), String> {
         let mut ctrl_c = Box::pin(tokio::signal::ctrl_c());
 
@@ -148,6 +201,18 @@ impl NetworkNode {
         Ok(())
     }
 
+    fn string_to_fr_vec(&self, message: &str, length: usize) -> Vec<Fr> {
+        let mut result = Vec::with_capacity(length);
+        let message_bytes = message.as_bytes();
+
+        for i in 0..length {
+            let hash = digest(format!("{}", message_bytes[i]));
+            result.push(Fr::from_le_bytes_mod_order(&hash.as_bytes()));
+        }
+
+        result
+    }
+
     async fn handle_command(&mut self, command: NodeCommand) {
         match command {
             NodeCommand::SendMessage(topic, message) => {
@@ -161,11 +226,24 @@ impl NetworkNode {
     async fn handle_behaviour_event(&mut self, event: P2PBehaviourEvent) {
         match event {
             P2PBehaviourEvent::Gossipsub(gossipsub::Event::Message {
-                propagation_source,
-                message_id,
+                propagation_source: _,
+                message_id: _,
                 message,
             }) => {
-                println!("Gossipsub message: {:?}", message);
+                println!("Received gossipsub message from peer");
+
+                // Deserialize and verify the proof
+                match self.verify_message(message.data.clone()) {
+                    Ok(true) => {
+                        println!("✅ Proof verified successfully!");
+                    }
+                    Ok(false) => {
+                        println!("❌ Proof verification failed!");
+                    }
+                    Err(e) => {
+                        println!("⚠️  Error verifying proof: {}", e);
+                    }
+                }
             }
             P2PBehaviourEvent::Gossipsub(gossipsub::Event::Subscribed { peer_id, topic }) => {
                 println!("Gossipsub subscribed to topic: {:?}", topic);

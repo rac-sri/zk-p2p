@@ -1,7 +1,4 @@
-use std::{sync::Arc, time::Duration};
-
-use libp2p::PeerId;
-use tokio::sync::Mutex;
+use std::time::Duration;
 
 use crate::p2p::{NetworkNode, NodeCommand};
 
@@ -14,7 +11,6 @@ pub async fn main() {
     let mut node = NetworkNode::new(9000);
     let mut node_2 = NetworkNode::new(9001);
 
-    let node_peer_id = node.swarm.local_peer_id().clone().to_string();
     let node_2_peer_id = *node_2.swarm.local_peer_id();
     // Wait for nodes to start listening
     tokio::time::sleep(Duration::from_secs(1)).await;
@@ -49,13 +45,6 @@ pub async fn main() {
         .send(NodeCommand::SendMessage(
             "test".to_string(),
             "Hello from node 1!".to_string(),
-        ))
-        .unwrap();
-
-    node_2_command_sender
-        .send(NodeCommand::SendMessage(
-            "test".to_string(),
-            "Hello from node 2!".to_string(),
         ))
         .unwrap();
 
