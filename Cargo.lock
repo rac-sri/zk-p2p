@@ -2430,6 +2430,8 @@ dependencies = [
  "ark-snark",
  "ark-std",
  "libp2p",
+ "serde",
+ "serde_json",
  "sha256",
  "tokio",
  "tracing",
