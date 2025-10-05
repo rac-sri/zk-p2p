@@ -16,8 +16,8 @@ pub async fn main() {
     tokio::time::sleep(Duration::from_secs(1)).await;
 
     // Subscribe to topics BEFORE spawning
-    node.subscribe_to_topic("test").await.unwrap();
-    node_2.subscribe_to_topic("test").await.unwrap();
+    node.subscribe_to_topic("zkproof").await.unwrap();
+    node_2.subscribe_to_topic("zkproof").await.unwrap();
 
     let node_command_sender = node.get_command_sender();
     let node_2_command_sender = node_2.get_command_sender();
