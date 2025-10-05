@@ -1,6 +1,8 @@
 use std::time::Duration;
+use tokio::sync::mpsc;
 
 use libp2p::futures::StreamExt;
+
 use libp2p::gossipsub::{IdentTopic, MessageAuthenticity, MessageId};
 use libp2p::swarm::Config;
 use libp2p::{Multiaddr, Transport};
@@ -12,28 +14,36 @@ use libp2p::{
     tcp, yamux,
 };
 
+pub enum NodeCommand {
+    SendMessage(String, String),
+    ConnectToPeer(String),
+}
 #[derive(NetworkBehaviour)]
-struct P2PBehaviour {
+pub struct P2PBehaviour {
     gossipsub: gossipsub::Behaviour,
     mdns: mdns::tokio::Behaviour,
 }
 
 pub struct NetworkNode {
-    swarm: Swarm<P2PBehaviour>,
+    pub(crate) swarm: Swarm<P2PBehaviour>,
+    command_receiver: mpsc::UnboundedReceiver<NodeCommand>,
+    command_sender: mpsc::UnboundedSender<NodeCommand>,
 }
 
 impl NetworkNode {
-    pub fn new(local_peer_id: PeerId, port: u16) -> Self {
+    pub fn new(port: u16) -> Self {
+        let keypair = libp2p::identity::Keypair::generate_ed25519();
+        let local_peer_id = PeerId::from(keypair.public());
+
+        let gossipsub_config = gossipsub::ConfigBuilder::default()
+            .validation_mode(gossipsub::ValidationMode::Permissive)
+            .build()
+            .expect("Valid config");
         let behaviour = P2PBehaviour {
-            gossipsub: gossipsub::Behaviour::new(
-                MessageAuthenticity::Author(local_peer_id),
-                gossipsub::Config::default(),
-            )
-            .unwrap(),
+            gossipsub: gossipsub::Behaviour::new(MessageAuthenticity::Anonymous, gossipsub_config)
+                .unwrap(),
             mdns: mdns::tokio::Behaviour::new(mdns::Config::default(), local_peer_id).unwrap(),
         };
-
-        let keypair = libp2p::identity::Keypair::generate_ed25519();
 
         // transport with encryption
         let transport = tcp::tokio::Transport::new(tcp::Config::default().nodelay(true))
@@ -49,10 +59,15 @@ impl NetworkNode {
             Config::with_tokio_executor()
                 .with_idle_connection_timeout(Duration::from_secs(60 * 60 * 24)),
         );
+        let (command_sender, command_receiver) = mpsc::unbounded_channel();
 
         let listen_addr = format!("/ip4/0.0.0.0/tcp/{}", port);
         swarm.listen_on(listen_addr.parse().unwrap()).unwrap();
-        Self { swarm }
+        Self {
+            swarm,
+            command_receiver,
+            command_sender,
+        }
     }
 
     pub async fn connect_to_peer(&mut self, addr: &str) -> Result<(), String> {
@@ -60,6 +75,10 @@ impl NetworkNode {
         let addr: Multiaddr = addr.parse().unwrap();
         self.swarm.dial(addr).unwrap();
         Ok(())
+    }
+
+    pub fn get_command_sender(&self) -> mpsc::UnboundedSender<NodeCommand> {
+        self.command_sender.clone()
     }
 
     pub async fn subscribe_to_topic(&mut self, topic_name: &str) -> Result<(), String> {
@@ -100,12 +119,23 @@ impl NetworkNode {
                         },
                         SwarmEvent::ConnectionEstablished { peer_id, .. } => {
                             println!("Connection established with: {:?}", peer_id);
+                            self.swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
                         },
                         SwarmEvent::ConnectionClosed { peer_id, .. } => {
                             println!("Connection closed with: {:?}", peer_id);
                         },
                         _ => {
                             println!("Other event: {:?}", event);
+                        }
+                    }
+                }
+                command = self.command_receiver.recv() => {
+                    match command {
+                        Some(command) => {
+                            self.handle_command(command).await;
+                        }
+                        None => {
+                            println!("No command received");
                         }
                     }
                 }
@@ -118,6 +148,16 @@ impl NetworkNode {
         Ok(())
     }
 
+    async fn handle_command(&mut self, command: NodeCommand) {
+        match command {
+            NodeCommand::SendMessage(topic, message) => {
+                self.send_message(&topic, &message).unwrap();
+            }
+            NodeCommand::ConnectToPeer(addr) => {
+                self.connect_to_peer(&addr).await.unwrap();
+            }
+        }
+    }
     async fn handle_behaviour_event(&mut self, event: P2PBehaviourEvent) {
         match event {
             P2PBehaviourEvent::Gossipsub(gossipsub::Event::Message {
@@ -136,8 +176,24 @@ impl NetworkNode {
             P2PBehaviourEvent::Gossipsub(gossipsub::Event::GossipsubNotSupported { .. }) => {
                 println!("Gossipsub not supported");
             }
-            P2PBehaviourEvent::Mdns(event) => {
-                println!("Mdns event: {:?}", event);
+            P2PBehaviourEvent::Mdns(mdns::Event::Discovered(list)) => {
+                for (peer_id, multiaddr) in list {
+                    println!("Discovered peer: {} at {}", peer_id, multiaddr);
+                    // Add peer to gossipsub
+                    self.swarm
+                        .behaviour_mut()
+                        .gossipsub
+                        .add_explicit_peer(&peer_id);
+                }
+            }
+            P2PBehaviourEvent::Mdns(mdns::Event::Expired(list)) => {
+                for (peer_id, multiaddr) in list {
+                    println!("Peer expired: {} at {}", peer_id, multiaddr);
+                    self.swarm
+                        .behaviour_mut()
+                        .gossipsub
+                        .remove_explicit_peer(&peer_id);
+                }
             }
         }
     }
