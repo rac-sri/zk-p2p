@@ -30,7 +30,7 @@ pub async fn main() {
         node_2.run().await.unwrap();
     });
 
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    tokio::time::sleep(Duration::from_secs(10)).await;
 
     println!("Connecting nodes...");
     let node_2_addr = format!("/ip4/127.0.0.1/tcp/9001/p2p/{}", node_2_peer_id);
