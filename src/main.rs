@@ -43,7 +43,7 @@ pub async fn main() {
     println!("Sending messages...");
     node_command_sender
         .send(NodeCommand::SendMessage(
-            "test".to_string(),
+            "zkproof".to_string(),
             "Hello from node 1!".to_string(),
         ))
         .unwrap();
