@@ -1,22 +1,11 @@
 use ark_bls12_381::Fr;
-
-use ark_crypto_primitives::crh::{CRHScheme, CRHSchemeGadget, pedersen};
-use ark_ec::AffineRepr;
-use ark_ec::twisted_edwards::Affine;
+use ark_crypto_primitives::crh::{CRHSchemeGadget, pedersen};
 use ark_ed_on_bls12_381::constraints::EdwardsVar;
-use ark_ff::BigInteger;
-use ark_ff::PrimeField;
-use ark_r1cs_std::alloc::AllocVar;
-use ark_r1cs_std::eq::EqGadget;
-use ark_r1cs_std::fields::fp::FpVar;
-use ark_r1cs_std::uint8::UInt8;
-
-use ark_r1cs_std::R1CSVar;
+use ark_ed_on_bls12_381::{EdwardsAffine, EdwardsProjective as JubJub};
+use ark_ff::{BigInteger, PrimeField};
+use ark_r1cs_std::{alloc::AllocVar, eq::EqGadget, uint8::UInt8};
 use ark_relations::r1cs::ConstraintSynthesizer;
 pub type ConstraintF = ark_bls12_381::Fr;
-
-use ark_ed_on_bls12_381::EdwardsAffine;
-use ark_ed_on_bls12_381::EdwardsProjective as JubJub;
 
 pub struct PedersenCircuit<'a> {
     message: Vec<Fr>,

@@ -1,23 +1,27 @@
+use std::time::Duration;
+
+use serde::{Deserialize, Serialize};
+use sha256::digest;
+
+use tokio::sync::mpsc;
+
 use ark_bls12_381::{Bls12_381, Fr, G1Affine};
 use ark_crypto_primitives::crh::CRHScheme;
-use ark_crypto_primitives::crh::pedersen::CRH;
-use ark_ed_on_bls12_381::{EdwardsAffine, EdwardsProjective as JubJub};
+use ark_ed_on_bls12_381::EdwardsProjective as JubJub;
 use ark_ff::{BigInteger, PrimeField, UniformRand};
 use ark_groth16::Groth16;
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use ark_snark::{CircuitSpecificSetupSNARK, SNARK};
 use ark_std::rand::SeedableRng;
-use libp2p::futures::StreamExt;
-use libp2p::gossipsub::{IdentTopic, MessageAuthenticity, MessageId};
-use libp2p::swarm::Config;
-use libp2p::{Multiaddr, Transport};
+
 use libp2p::{
-    PeerId, Swarm, gossipsub, mdns, noise, swarm::NetworkBehaviour, swarm::SwarmEvent, tcp, yamux,
+    Multiaddr, PeerId, Swarm, Transport,
+    futures::StreamExt,
+    gossipsub::{self, IdentTopic, MessageAuthenticity, MessageId},
+    identify, mdns, noise,
+    swarm::{Config, NetworkBehaviour, SwarmEvent},
+    tcp, yamux,
 };
-use serde::{Deserialize, Serialize};
-use sha256::digest;
-use std::time::Duration;
-use tokio::sync::mpsc;
 
 use crate::zk::{PedersenCircuit, Window};
 
@@ -36,6 +40,7 @@ pub enum NodeCommand {
 pub struct P2PBehaviour {
     gossipsub: gossipsub::Behaviour,
     mdns: mdns::tokio::Behaviour,
+    identity: identify::Behaviour,
 }
 
 pub struct NetworkNode {
@@ -60,6 +65,10 @@ impl NetworkNode {
             gossipsub: gossipsub::Behaviour::new(MessageAuthenticity::Anonymous, gossipsub_config)
                 .unwrap(),
             mdns: mdns::tokio::Behaviour::new(mdns::Config::default(), local_peer_id).unwrap(),
+            identity: identify::Behaviour::new(identify::Config::new(
+                "/p2p-zk-blockchain/1.0.0".to_string(),
+                keypair.public(),
+            )),
         };
 
         type CRH = ark_crypto_primitives::crh::pedersen::CRH<JubJub, Window>;
@@ -93,6 +102,9 @@ impl NetworkNode {
 
         let listen_addr = format!("/ip4/0.0.0.0/tcp/{}", port);
         swarm.listen_on(listen_addr.parse().unwrap()).unwrap();
+        println!("🎧 Listening on {}", listen_addr);
+        println!("✨ Node initialization complete!\n");
+
         Self {
             swarm,
             command_receiver,
@@ -104,7 +116,7 @@ impl NetworkNode {
     }
 
     pub async fn connect_to_peer(&mut self, addr: &str) -> Result<(), String> {
-        println!("Connecting to peer: {}", addr);
+        println!("🔌 Connecting to peer: {}", addr);
         let addr: Multiaddr = addr.parse().unwrap();
         self.swarm.dial(addr).unwrap();
         Ok(())
@@ -121,11 +133,13 @@ impl NetworkNode {
             .gossipsub
             .subscribe(&topic)
             .map_err(|e| format!("Failed to subscribe to topic: {}", e))?;
-        println!("Subscribed to topic: {}", topic_name);
+        println!("📬 Subscribed to topic: '{}'", topic_name);
         Ok(())
     }
 
     pub fn send_message(&mut self, topic_name: &str, message: &str) -> Result<MessageId, String> {
+        println!("\n📤 Preparing to send message: '{}'", message);
+
         let mut rng = ark_std::test_rng();
         let num_generators = 3;
         let mut generators = Vec::with_capacity(num_generators);
@@ -134,6 +148,7 @@ impl NetworkNode {
         }
 
         let message_fr = self.string_to_fr_vec(message, 3);
+        println!("  ⚙️  Converted message to field elements");
 
         // Convert message_fr to bytes (same way as in circuit)
         let input_bytes: Vec<u8> = message_fr
@@ -143,11 +158,14 @@ impl NetworkNode {
 
         type CRH = ark_crypto_primitives::crh::pedersen::CRH<JubJub, Window>;
         let hash_result = CRH::evaluate(&self.crh_params, input_bytes.as_slice()).unwrap();
+        println!("  🔐 Computed Pedersen hash");
 
         let circuit = PedersenCircuit::new(message_fr.clone(), &self.crh_params, &hash_result);
 
+        println!("  🧮 Generating ZK proof...");
         let mut rng = ark_std::rand::rngs::StdRng::from_seed([1; 32]);
         let proof = Groth16::<Bls12_381>::prove(&self.proving_key, circuit, &mut rng).unwrap();
+        println!("  ✅ ZK proof generated");
         let mut buffer = Vec::new();
         proof.serialize_uncompressed(&mut buffer).unwrap();
 
@@ -167,6 +185,7 @@ impl NetworkNode {
         };
 
         let serialized = serde_json::to_vec(&message_data).unwrap();
+        println!("  📦 Packaged proof + hash ({} bytes)", serialized.len());
 
         let topic = IdentTopic::new(topic_name);
         let message_id = self
@@ -176,7 +195,10 @@ impl NetworkNode {
             .publish(topic, serialized)
             .map_err(|e| format!("Failed to publish message: {}", e))?;
 
-        println!("Sent message to topic '{}': {:?}", topic_name, proof);
+        println!(
+            "  🚀 Published to topic '{}' (MessageId: {})\n",
+            topic_name, message_id
+        );
         Ok(message_id)
     }
 
@@ -211,18 +233,17 @@ impl NetworkNode {
                 event = self.swarm.select_next_some() => {
                     match event {
                         SwarmEvent::Behaviour(event) => {
-                            println!("Behaviour event: {:?}", event);
                             self.handle_behaviour_event(event).await;
                         },
                         SwarmEvent::NewListenAddr { address, .. } => {
-                            println!("New listen address: {:?}", address);
+                            println!("🌐 Listening on: {}", address);
                         },
-                        SwarmEvent::ConnectionEstablished { peer_id, .. } => {
-                            println!("Connection established with: {:?}", peer_id);
+                        SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
+                            println!("🤝 Connection established with: {} ({})", peer_id, endpoint.get_remote_address());
                             self.swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
                         },
-                        SwarmEvent::ConnectionClosed { peer_id, .. } => {
-                            println!("Connection closed with: {:?}", peer_id);
+                        SwarmEvent::ConnectionClosed { peer_id, cause, .. } => {
+                            println!("👋 Connection closed with: {} ({:?})", peer_id, cause);
                         },
                         _ => {
                             println!("Other event: {:?}", event);
@@ -273,40 +294,45 @@ impl NetworkNode {
     async fn handle_behaviour_event(&mut self, event: P2PBehaviourEvent) {
         match event {
             P2PBehaviourEvent::Gossipsub(gossipsub::Event::Message {
-                propagation_source: _,
-                message_id: _,
+                propagation_source,
+                message_id,
                 message,
             }) => {
-                println!("Received gossipsub message from peer");
+                println!("\n📨 Received message from peer: {}", propagation_source);
+                println!("  📋 Message ID: {}", message_id);
+                println!("  📊 Size: {} bytes", message.data.len());
 
                 // Deserialize and verify the proof
+                print!("  🔍 Verifying ZK proof... ");
                 match self.verify_message(message.data.clone()) {
                     Ok(true) => {
-                        println!("✅ Proof verified successfully!");
+                        println!("✅ VALID");
+                        println!("  🎉 Proof verified successfully!\n");
                         // TODO: sign the message using your public key
                     }
                     Ok(false) => {
-                        println!("❌ Proof verification failed!");
+                        println!("❌ INVALID");
+                        println!("  ⚠️  Proof verification failed!\n");
                     }
                     Err(e) => {
-                        println!("⚠️  Error verifying proof: {}", e);
+                        println!("💥 ERROR");
+                        println!("  ⚠️  Error: {}\n", e);
                     }
                 }
             }
-            P2PBehaviourEvent::Gossipsub(gossipsub::Event::Subscribed { peer_id, topic }) => {
-                println!("Gossipsub subscribed to topic: {:?}", topic);
+            P2PBehaviourEvent::Gossipsub(gossipsub::Event::Subscribed { peer_id: _, topic }) => {
+                println!("📢 Peer subscribed to topic: {}", topic);
             }
-            P2PBehaviourEvent::Gossipsub(gossipsub::Event::Unsubscribed { peer_id, topic }) => {
-                println!("Gossipsub unsubscribed from topic: {:?}", topic);
+            P2PBehaviourEvent::Gossipsub(gossipsub::Event::Unsubscribed { peer_id: _, topic }) => {
+                println!("📵 Peer unsubscribed from topic: {}", topic);
             }
             P2PBehaviourEvent::Gossipsub(gossipsub::Event::GossipsubNotSupported { .. }) => {
-                println!("Gossipsub not supported");
+                println!("⚠️  Gossipsub not supported by peer");
             }
             P2PBehaviourEvent::Mdns(mdns::Event::Discovered(list)) => {
-                println!("Discovered peers: {:?}", list);
+                println!("🔍 mDNS discovered {} peer(s)", list.len());
                 for (peer_id, multiaddr) in list {
-                    println!("Discovered peer: {} at {}", peer_id, multiaddr);
-                    // Add peer to gossipsub
+                    println!("  ➕ Peer: {} at {}", peer_id, multiaddr);
                     self.swarm
                         .behaviour_mut()
                         .gossipsub
@@ -314,14 +340,28 @@ impl NetworkNode {
                 }
             }
             P2PBehaviourEvent::Mdns(mdns::Event::Expired(list)) => {
-                println!("Peer expired: {:?}", list);
+                println!("⏰ {} peer(s) expired via mDNS", list.len());
                 for (peer_id, multiaddr) in list {
-                    println!("Peer expired: {} at {}", peer_id, multiaddr);
+                    println!("  ➖ Peer: {} at {}", peer_id, multiaddr);
                     self.swarm
                         .behaviour_mut()
                         .gossipsub
                         .remove_explicit_peer(&peer_id);
                 }
+            }
+            P2PBehaviourEvent::Identity(identify::Event::Received { peer_id, info }) => {
+                println!("🆔 Identified peer: {}", peer_id);
+                println!("  📋 Protocol: {}", info.protocol_version);
+                println!("  🔑 Public Key: {:?}", info.public_key);
+            }
+            P2PBehaviourEvent::Identity(identify::Event::Sent { peer_id }) => {
+                println!("📤 Sent identity to peer: {}", peer_id);
+            }
+            P2PBehaviourEvent::Identity(identify::Event::Pushed { peer_id, info: _ }) => {
+                println!("🔄 Pushed updated identity to peer: {}", peer_id);
+            }
+            P2PBehaviourEvent::Identity(identify::Event::Error { peer_id, error }) => {
+                println!("❌ Identity error with {}: {:?}", peer_id, error);
             }
         }
     }
